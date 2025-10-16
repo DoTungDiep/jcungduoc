@@ -1,0 +1,95 @@
+```python
+# storage/db.py
+import sqlite3
+import threading
+import json
+import os
+import asyncio
+from typing import Any, Optional, Tuple
+
+class DB:
+    """
+    Minimal thread-safe SQLite wrapper for OSINT tool.
+    Includes a `cache` table used for caching network responses or expensive operations.
+    """
+
+    def __init__(self, path: str = "data/osint_cache.db"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        self._init_tables()
+
+    def _init_tables(self):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    expires_at REAL
+                )
+            """)
+            self.conn.commit()
+
+    def execute(self, query: str, params: Tuple = ()) -> sqlite3.Cursor:
+        """Thread-safe SQL execution with auto-commit."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(query, params)
+            self.conn.commit()
+            return cur
+
+    def get(self, query: str, params: Tuple = ()) -> Optional[sqlite3.Row]:
+        """Fetch a single row."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(query, params)
+            return cur.fetchone()
+
+    def get_all(self, query: str, params: Tuple = ()) -> list[sqlite3.Row]:
+        """Fetch multiple rows."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(query, params)
+            return cur.fetchall()
+
+    # ---------------- Cache Layer ---------------- #
+    def cache_set(self, key: str, value: Any, ttl: Optional[int] = None):
+        """Store value (JSON serialized) with optional TTL (seconds)."""
+        expires_at = time.time() + ttl if ttl else None
+        data = json.dumps(value)
+        self.execute("""
+            INSERT OR REPLACE INTO cache (key, value, expires_at)
+            VALUES (?, ?, ?)
+        """, (key, data, expires_at))
+
+    def cache_get(self, key: str) -> Optional[Any]:
+        """Retrieve cached value if valid."""
+        row = self.get("SELECT value, expires_at FROM cache WHERE key = ?", (key,))
+        if not row:
+            return None
+        if row["expires_at"] and row["expires_at"] < time.time():
+            self.cache_delete(key)
+            return None
+        return json.loads(row["value"])
+
+    def cache_delete(self, key: str):
+        """Remove a cache entry."""
+        self.execute("DELETE FROM cache WHERE key = ?", (key,))
+
+    def cache_clear(self):
+        """Clear all cached entries."""
+        self.execute("DELETE FROM cache")
+
+    # ---------------- Async Wrappers ---------------- #
+    async def a_cache_get(self, key: str):
+        return await asyncio.to_thread(self.cache_get, key)
+
+    async def a_cache_set(self, key: str, value: Any, ttl: Optional[int] = None):
+        await asyncio.to_thread(self.cache_set, key, value, ttl)
+
+    async def a_execute(self, query: str, params: Tuple = ()):
+        return await asyncio.to_thread(self.execute, query, params)
+```
